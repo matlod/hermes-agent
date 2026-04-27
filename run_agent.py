@@ -4913,10 +4913,14 @@ class AIAgent:
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
-        
+
         Called once per session (cached on self._cached_system_prompt) and only
         rebuilt after context compression events. This ensures the system prompt
         is stable across all turns in a session, maximizing prefix cache hits.
+
+        Side effect: stores self._system_prompt_manifest — a list of
+        (label, content) tuples for each layer, enabling observability tools
+        (Context Lens) to attribute each section of the assembled prompt.
         """
         # Layers (in order):
         #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
@@ -4927,6 +4931,9 @@ class AIAgent:
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
 
+        # Labeled manifest for observability (Context Lens)
+        _manifest = []
+
         # Try SOUL.md as primary identity unless the caller explicitly skipped it.
         # Some execution modes (cron) still want HERMES_HOME persona while keeping
         # cwd project instructions disabled.
@@ -4935,35 +4942,45 @@ class AIAgent:
             _soul_content = load_soul_md()
             if _soul_content:
                 prompt_parts = [_soul_content]
+                _manifest.append(("soul_md", _soul_content))
                 _soul_loaded = True
 
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+            _manifest.append(("default_identity", DEFAULT_AGENT_IDENTITY))
 
         # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
         prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
+        tool_guidance_labels = []
         if "memory" in self.valid_tool_names:
             tool_guidance.append(MEMORY_GUIDANCE)
+            tool_guidance_labels.append("memory_guidance")
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+            tool_guidance_labels.append("session_search_guidance")
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
+            tool_guidance_labels.append("skills_save_guidance")
         # Kanban worker/orchestrator lifecycle — only present when the
         # dispatcher spawned this process (kanban_show check_fn gates on
         # HERMES_KANBAN_TASK env var). Normal chat sessions never see
         # this block.
         if "kanban_show" in self.valid_tool_names:
             tool_guidance.append(KANBAN_GUIDANCE)
+            tool_guidance_labels.append("kanban_guidance")
         if tool_guidance:
-            prompt_parts.append(" ".join(tool_guidance))
+            _joined = " ".join(tool_guidance)
+            prompt_parts.append(_joined)
+            _manifest.append(("tool_guidance:" + "+".join(tool_guidance_labels), _joined))
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
             prompt_parts.append(nous_subscription_prompt)
+            _manifest.append(("nous_subscription", nous_subscription_prompt))
         # Tool-use enforcement: tells the model to actually call tools instead
         # of describing intended actions.  Controlled by config.yaml
         # agent.tool_use_enforcement:
@@ -4987,15 +5004,14 @@ class AIAgent:
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
             if _inject:
                 prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _manifest.append(("tool_use_enforcement", TOOL_USE_ENFORCEMENT_GUIDANCE))
                 _model_lower = (self.model or "").lower()
-                # Google model operational guidance (conciseness, absolute
-                # paths, parallel tool calls, verify-before-edit, etc.)
                 if "gemini" in _model_lower or "gemma" in _model_lower:
                     prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-                # OpenAI GPT/Codex execution discipline (tool persistence,
-                # prerequisite checks, verification, anti-hallucination).
+                    _manifest.append(("google_model_guidance", GOOGLE_MODEL_OPERATIONAL_GUIDANCE))
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                    _manifest.append(("openai_model_guidance", OPENAI_MODEL_EXECUTION_GUIDANCE))
 
         # so it can refer the user to them rather than reinventing answers.
 
@@ -5003,24 +5019,26 @@ class AIAgent:
         # API-call time only so it stays out of the cached/stored system prompt.
         if system_message is not None:
             prompt_parts.append(system_message)
+            _manifest.append(("user_system_message", system_message))
 
         if self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
+                    _manifest.append(("memory_md", mem_block))
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+                    _manifest.append(("user_md", user_block))
 
-        # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
                     prompt_parts.append(_ext_mem_block)
+                    _manifest.append(("external_memory_provider", _ext_mem_block))
             except Exception:
                 pass
 
@@ -5041,6 +5059,7 @@ class AIAgent:
             skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
+            _manifest.append(("skills_index", skills_prompt))
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
@@ -5052,6 +5071,7 @@ class AIAgent:
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
+                _manifest.append(("context_files", context_files_prompt))
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
@@ -5063,38 +5083,45 @@ class AIAgent:
         if self.provider:
             timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
+        _manifest.append(("timestamp", timestamp_line))
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
         # so the agent can correctly report which model it is (workaround for API bug).
         if self.provider == "alibaba":
             _model_short = self.model.split("/")[-1] if "/" in self.model else self.model
-            prompt_parts.append(
+            _alibaba_hint = (
                 f"You are powered by the model named {_model_short}. "
                 f"The exact model ID is {self.model}. "
                 f"When asked what model you are, always answer based on this information, "
                 f"not on any model name returned by the API."
             )
+            prompt_parts.append(_alibaba_hint)
+            _manifest.append(("alibaba_model_identity", _alibaba_hint))
 
         # Environment hints (WSL, Termux, etc.) — tell the agent about the
         # execution environment so it can translate paths and adapt behavior.
         _env_hints = build_environment_hints()
         if _env_hints:
             prompt_parts.append(_env_hints)
+            _manifest.append(("environment_hints", _env_hints))
 
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
-            prompt_parts.append(PLATFORM_HINTS[platform_key])
+            _ph = PLATFORM_HINTS[platform_key]
+            prompt_parts.append(_ph)
+            _manifest.append(("platform_hint", _ph))
         elif platform_key:
-            # Check plugin registry for platform-specific LLM guidance
             try:
                 from gateway.platform_registry import platform_registry
                 _entry = platform_registry.get(platform_key)
                 if _entry and _entry.platform_hint:
                     prompt_parts.append(_entry.platform_hint)
+                    _manifest.append(("platform_hint_plugin", _entry.platform_hint))
             except Exception:
                 pass
 
+        self._system_prompt_manifest = _manifest
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 
     # =========================================================================
@@ -10895,6 +10922,10 @@ class AIAgent:
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
                 sender_id=getattr(self, "_user_id", None) or "",
+                system_prompt=active_system_prompt or "",
+                system_prompt_manifest=getattr(self, "_system_prompt_manifest", []),
+                tool_names=list(self.valid_tool_names) if self.valid_tool_names else [],
+                tool_count=len(self.tools) if self.tools else 0,
             )
             _ctx_parts: list[str] = []
             for r in _pre_results:
@@ -11332,6 +11363,23 @@ class AIAgent:
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _gt_role_chars = {}
+                        _gt_role_counts = {}
+                        for _am in api_messages:
+                            _role = _am.get("role", "unknown")
+                            _c = _am.get("content", "")
+                            _ch = len(str(_c)) if _c else 0
+                            for _tc in (_am.get("tool_calls") or []):
+                                _ch += len(json.dumps(_tc, default=str))
+                            _gt_role_chars[_role] = _gt_role_chars.get(_role, 0) + _ch
+                            _gt_role_counts[_role] = _gt_role_counts.get(_role, 0) + 1
+                        _gt_tool_schemas_chars = sum(
+                            len(json.dumps(t, default=str)) for t in self.tools
+                        ) if self.tools else 0
+                        import hashlib as _hashlib
+                        _gt_tool_schema_hash = "sha256:" + _hashlib.sha256(
+                            json.dumps(self.tools, sort_keys=True, default=str).encode()
+                        ).hexdigest() if self.tools else ""
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -11347,6 +11395,10 @@ class AIAgent:
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=self.max_tokens,
+                            gt_role_chars=_gt_role_chars,
+                            gt_role_counts=_gt_role_counts,
+                            gt_tool_schemas_chars=_gt_tool_schemas_chars,
+                            gt_tool_schema_hash=_gt_tool_schema_hash,
                         )
                     except Exception:
                         pass
