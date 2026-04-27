@@ -1126,6 +1126,27 @@ def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        _gt_role_chars: dict[str, int] = {}
+                        _gt_role_counts: dict[str, int] = {}
+                        for _am in api_messages:
+                            _role = _am.get("role", "unknown")
+                            _content = _am.get("content", "")
+                            _char_count = len(str(_content)) if _content else 0
+                            for _tc in (_am.get("tool_calls") or []):
+                                _char_count += len(json.dumps(_tc, default=str))
+                            _gt_role_chars[_role] = _gt_role_chars.get(_role, 0) + _char_count
+                            _gt_role_counts[_role] = _gt_role_counts.get(_role, 0) + 1
+                        _gt_tool_schemas_chars = (
+                            sum(len(json.dumps(t, default=str)) for t in agent.tools)
+                            if agent.tools else 0
+                        )
+                        if agent.tools:
+                            import hashlib as _hashlib
+                            _gt_tool_schema_hash = "sha256:" + _hashlib.sha256(
+                                json.dumps(agent.tools, sort_keys=True, default=str).encode()
+                            ).hexdigest()
+                        else:
+                            _gt_tool_schema_hash = ""
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -1147,6 +1168,10 @@ def run_conversation(
                             tool_count=len(agent.tools or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
+                            gt_role_chars=_gt_role_chars,
+                            gt_role_counts=_gt_role_counts,
+                            gt_tool_schemas_chars=_gt_tool_schemas_chars,
+                            gt_tool_schema_hash=_gt_tool_schema_hash,
                             max_tokens=agent.max_tokens,
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
